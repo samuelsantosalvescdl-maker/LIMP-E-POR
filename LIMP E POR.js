@@ -28,7 +28,7 @@ function ETQ_addMenu_() {
 function buildMenu_() {
   SpreadsheetApp.getUi()
     .createMenu('ACIONADORES')
-    .addItem("🖨️ Impressão (ETIQUETAS direto → PDF)'", 'almox_impressaoEtiquetasMulti_')
+    .addItem("🖨️ Impressão (ETIQUETAS direto → PDF)'", 'runFracionamentosToEtiquetasAndPrint_')
     .addItem('Liberar permissões', 'liberarPermissoes')
     .addItem('Anti-edit', 'antiEdit_')
     .addToUi();
@@ -172,6 +172,7 @@ const CFG_ETQ = {
 };
 
 var __BC_CACHE_ETQ = {};
+var __ETQ_FRAC_RUNNING = false;
 
 function Setup_InstalarMenuEtiquetas() {
   ScriptApp.getProjectTriggers()
@@ -287,6 +288,22 @@ function ETQ_lerListaEtiquetas_() {
 }
 
 function almox_impressaoEtiquetasMulti_() {
+  if (!__ETQ_FRAC_RUNNING) {
+    const ss = SpreadsheetApp.getActive();
+    const nrFrac = ss.getRangeByName('DADOSFRACIONAMENTOS');
+    const nrEtq = ss.getRangeByName(CFG_ETQ.data.namedRange);
+    if (nrFrac && nrEtq) {
+      const prep = collectFracionamentosEtiquetas_(nrFrac);
+      if (prep.rowsFracAbs.length) {
+        __ETQ_FRAC_RUNNING = true;
+        try {
+          return runFracionamentosToEtiquetasAndPrint_();
+        } finally {
+          __ETQ_FRAC_RUNNING = false;
+        }
+      }
+    }
+  }
   ETQ_assertTemplate_();
   ETQ_cleanupOldOutputs_();
 
@@ -343,16 +360,77 @@ function runFracionamentosToEtiquetasAndPrint_() {
   if (!nrFrac) throw new Error('Named range "DADOSFRACIONAMENTOS" não encontrado.');
   if (!nrEtq)  throw new Error(`Named range "${CFG_ETQ.data.namedRange}" não encontrado.`);
 
-  const shF = nrFrac.getSheet();
   const shE = nrEtq.getSheet();
+  const prep = collectFracionamentosEtiquetas_(nrFrac);
+  const toF = prep.toF;
+  const toI = prep.toI;
+  const rowsFracAbs = prep.rowsFracAbs;
 
-  const colH = 8;   // quantidade + nota
-  const colP = 16;  // lote/código -> ETIQUETAS!F
+  if (!rowsFracAbs.length) {
+    SpreadsheetApp.getActive().toast('Nada para imprimir: sem linhas elegíveis.', 'Impressão', 6);
+    return;
+  }
 
   const etqTop  = nrEtq.getRow();
   const etqHgt  = nrEtq.getNumRows();
   const etqColF = nrEtq.getColumn() + 5;  // F
   const etqColI = nrEtq.getColumn() + 8;  // I
+
+  // primeira linha vazia em F dentro do named range
+  const colF_disp = shE.getRange(etqTop, etqColF, etqHgt, 1).getDisplayValues().map(r => String(r[0] || '').trim());
+  const firstEmptyIdx = colF_disp.findIndex(v => v === '');
+  let writeR = (firstEmptyIdx >= 0) ? (etqTop + firstEmptyIdx) : (etqTop + etqHgt);
+
+  const n = toF.length;
+  const needLast = writeR + n - 1;
+  if (needLast > shE.getMaxRows()) shE.insertRowsAfter(shE.getMaxRows(), needLast - shE.getMaxRows());
+
+  const rangeF = shE.getRange(writeR, etqColF, n, 1);
+  const rangeI = shE.getRange(writeR, etqColI, n, 1);
+
+  // 1) Escreve em ETIQUETAS com permissão garantida + snapshot pontual
+  withAntiEditTemporaryUnblock_([rangeF, rangeI], () => {
+    rangeF.setValues(toF);
+    rangeI.setValues(toI);
+  });
+
+  // 2) Gera PDF (não precisa ficar em modo edit liberado)
+  __ETQ_FRAC_RUNNING = true;
+  try {
+    almox_impressaoEtiquetasMulti_();
+  } finally {
+    __ETQ_FRAC_RUNNING = false;
+    // 3) Limpa ETIQUETAS com permissão garantida + snapshot pontual
+    withAntiEditTemporaryUnblock_([rangeF, rangeI], () => {
+      rangeF.clearContent();
+      rangeI.clearContent();
+    });
+  }
+
+  // Carimba NOTA em H nas linhas corretas (contíguas em blocos)
+  const stamp = (function(){
+    const d=new Date(),p=x=>x<10?'0'+x:x;
+    return `Impresso, ${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  })();
+
+  const groups = _groupContiguousRows_(rowsFracAbs);
+  groups.forEach(g => {
+    const notesMatrix = Array(g.len).fill([stamp]);
+    // nota não afeta DV, mas ainda assim é uma escrita — e pode estar em range travado
+    const rgNotes = prep.shF.getRange(g.start, prep.colH, g.len, 1);
+
+    withAntiEditTemporaryUnblock_([rgNotes], () => {
+      rgNotes.setNotes(notesMatrix);
+    });
+  });
+
+  SpreadsheetApp.getActive().toast('Impressão concluída ✅', 'Impressão', 6);
+}
+
+function collectFracionamentosEtiquetas_(nrFrac) {
+  const shF = nrFrac.getSheet();
+  const colH = 8;   // quantidade + nota
+  const colP = 16;  // lote/código -> ETIQUETAS!F
 
   const frTop = nrFrac.getRow();
   const frHgt = nrFrac.getNumRows();
@@ -378,58 +456,7 @@ function runFracionamentosToEtiquetasAndPrint_() {
     }
   }
 
-  if (!rowsFracAbs.length) {
-    SpreadsheetApp.getActive().toast('Nada para imprimir: sem linhas elegíveis.', 'Impressão', 6);
-    return;
-  }
-
-  // primeira linha vazia em F dentro do named range
-  const colF_disp = shE.getRange(etqTop, etqColF, etqHgt, 1).getDisplayValues().map(r => String(r[0] || '').trim());
-  const firstEmptyIdx = colF_disp.findIndex(v => v === '');
-  let writeR = (firstEmptyIdx >= 0) ? (etqTop + firstEmptyIdx) : (etqTop + etqHgt);
-
-  const n = toF.length;
-  const needLast = writeR + n - 1;
-  if (needLast > shE.getMaxRows()) shE.insertRowsAfter(shE.getMaxRows(), needLast - shE.getMaxRows());
-
-  const rangeF = shE.getRange(writeR, etqColF, n, 1);
-  const rangeI = shE.getRange(writeR, etqColI, n, 1);
-
-  // 1) Escreve em ETIQUETAS com permissão garantida + snapshot pontual
-  withAntiEditTemporaryUnblock_([rangeF, rangeI], () => {
-    rangeF.setValues(toF);
-    rangeI.setValues(toI);
-  });
-
-  // 2) Gera PDF (não precisa ficar em modo edit liberado)
-  try {
-    almox_impressaoEtiquetasMulti_();
-  } finally {
-    // 3) Limpa ETIQUETAS com permissão garantida + snapshot pontual
-    withAntiEditTemporaryUnblock_([rangeF, rangeI], () => {
-      rangeF.clearContent();
-      rangeI.clearContent();
-    });
-  }
-
-  // Carimba NOTA em H nas linhas corretas (contíguas em blocos)
-  const stamp = (function(){
-    const d=new Date(),p=x=>x<10?'0'+x:x;
-    return `Impresso, ${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
-  })();
-
-  const groups = _groupContiguousRows_(rowsFracAbs);
-  groups.forEach(g => {
-    const notesMatrix = Array(g.len).fill([stamp]);
-    // nota não afeta DV, mas ainda assim é uma escrita — e pode estar em range travado
-    const rgNotes = shF.getRange(g.start, colH, g.len, 1);
-
-    withAntiEditTemporaryUnblock_([rgNotes], () => {
-      rgNotes.setNotes(notesMatrix);
-    });
-  });
-
-  SpreadsheetApp.getActive().toast('Impressão concluída ✅', 'Impressão', 6);
+  return { shF, colH, toF, toI, rowsFracAbs };
 }
 
 function _groupContiguousRows_(rowsAbs) {
