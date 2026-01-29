@@ -825,28 +825,8 @@ function clearAntiValidationInRangeFast_(range) {
 function clearAntiValidationForRanges_(ranges) {
   const list = (ranges || []).filter(Boolean);
   if (!list.length) return;
-
-  const bySheet = new Map();
   list.forEach(r => {
-    const sh = r.getSheet();
-    const id = sh.getSheetId();
-    if (!bySheet.has(id)) bySheet.set(id, { sheet: sh, ranges: [] });
-    bySheet.get(id).ranges.push(r);
-  });
-
-  bySheet.forEach(entry => {
-    const batchSize = 100;
-    for (let i = 0; i < entry.ranges.length; i += batchSize) {
-      const batch = entry.ranges.slice(i, i + batchSize);
-      const notations = batch.map(r => r.getA1Notation());
-      try {
-        runSheetOpWithRetry_(() => entry.sheet.getRangeList(notations).clearDataValidations());
-      } catch (_) {
-        batch.forEach(r => {
-          runSheetOpWithRetry_(() => r.clearDataValidations());
-        });
-      }
-    }
+    clearAntiValidationInRangeFast_(r);
   });
 }
 
