@@ -803,7 +803,18 @@ function getFormulaSeparator_() {
 
 function applyAntiValidationToRangeFast_(range, rule) {
   forEachRangeChunk_(range, ANTI_CHUNK_ROWS_, chunk => {
-    runSheetOpWithRetry_(() => chunk.setDataValidation(rule));
+    const dvs = chunk.getDataValidations();
+    let changed = false;
+    for (let r = 0; r < dvs.length; r++) {
+      for (let c = 0; c < dvs[0].length; c++) {
+        const dv = dvs[r][c];
+        if (!dv || isAntiEditValidation_(dv)) {
+          dvs[r][c] = rule;
+          changed = true;
+        }
+      }
+    }
+    if (changed) runSheetOpWithRetry_(() => chunk.setDataValidations(dvs));
   });
 }
 
