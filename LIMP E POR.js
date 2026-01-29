@@ -14,6 +14,7 @@ const ANTI_MODE_CELL = 'A1';
 const ANTI_MODE_NAMED_RANGE = 'ANTI_EDIT_MODE';
 const ANTI_SNAP_PREFIX = '_ANTI_SNAP_';
 const ANTI_CHUNK_ROWS_ = 200;
+const ANTI_HELP_TEXT = 'ANTI_EDIT_LOCK';
 
 /* ========= Menu ========= */
 function onOpen() {
@@ -787,6 +788,7 @@ function buildAntiValidationRule_(snapName) {
   return SpreadsheetApp.newDataValidation()
     .requireFormulaSatisfied(formula)
     .setAllowInvalid(false)
+    .setHelpText(ANTI_HELP_TEXT)
     .build();
 }
 
@@ -857,6 +859,7 @@ function withAntiEditTemporaryUnblock_(ranges, fn) {
 function isAntiEditValidation_(dv) {
   try {
     if (!dv) return false;
+    if (dv.getHelpText && dv.getHelpText() !== ANTI_HELP_TEXT) return false;
     if (dv.getCriteriaType && dv.getCriteriaType() !== SpreadsheetApp.DataValidationCriteria.CUSTOM_FORMULA) return false;
     const values = dv.getCriteriaValues && dv.getCriteriaValues();
     const formula = values && values[0] ? String(values[0]) : '';
