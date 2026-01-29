@@ -1,159 +1,36 @@
 /*********************************************************
- *  ALMOX — FRACIONAMENTO + ETIQUETAS + ANTI MÃO-BOBA
+ *  ALMOX — FRACIONAMENTO + ETIQUETAS + ANTI-EDIT
  *
  *  ✅ SEM "CONFIRMAÇÃO DE COMANDOS" / SEM rodar como proprietário
  *  ✅ Sequencial LIF em DADOSFRACIONAMENTOS (col J -> escreve em P)
  *  ✅ Impressão (ETIQUETAS) + PDF + limpeza + nota em H
- *  ✅ Anti Mão-Boba: bloqueia o proprietário nas áreas protegidas
+ *  ✅ Anti-edit: bloqueia o proprietário nas áreas protegidas
  *  ✅ Scripts SEMPRE podem escrever (sem virar "inválido" depois)
- *  ✅ Trigger diário 03:00 para reforçar bloqueio e atualizar snapshots
  *********************************************************/
 
-/* =====================================================================
- * 0) CONFIG ANTI
- * ===================================================================== */
-const ALMOX_ANTI = {
-  CONFIG_SHEET: '__ANTI_MAO_BOBA__',
-  EDIT_MODE_A1: 'A1',
-  EDIT_MODE_NAMED: 'ANTI_EDIT_MODE',
+/* ===================== [ANTI-EDIT] ====================== */
+const ANTI_SHEET_NAME = '_ANTI_INDENTIFICACAO_';
+const ANTI_MODE_CELL = 'A1';
+const ANTI_MODE_NAMED_RANGE = 'ANTI_EDIT_MODE';
+const ANTI_SNAP_PREFIX = '_ANTI_SNAP_';
+const ANTI_CHUNK_ROWS_ = 200;
 
-  SNAP_PREFIX: '__ANTI_SNAP__',
-  HELP_TEXT: 'Bloqueado (Anti Mão-Boba). Use o menu para liberar por 10 min.',
-
-  UNLOCK_MINUTES: 10,
-
-  // Segurança (evita snapshot “gigante” em abas que foram esticadas por acidente)
-  SAFE_MAX_ROW: 8000,
-  SAFE_MAX_COL: 300,
-
-  // Chunk para copiar valores pro snapshot (reduz Service error)
-  ROW_CHUNK: 120,
-  COL_CHUNK: 35,
-
-  RETRIES: 10
-};
-
-/* =====================================================================
- * 0.1) WRAPPER — Scripts sempre podem escrever SEM ficar inválido depois
- *  - Uso:
- *      almox_anti_runUnlocked_(ss, () => {
- *         // ... escreve em ranges ...
- *      }, [range1, range2]);
- *  - Ele:
- *      1) liga ANTI_EDIT_MODE (aceita qualquer valor)
- *      2) executa a escrita
- *      3) atualiza SOMENTE o snapshot dos ranges alterados (leve)
- *      4) volta ANTI_EDIT_MODE ao estado anterior
- * ===================================================================== */
-function almox_anti_runUnlocked_(ss, fn, touchRanges) {
-  ss = ss || SpreadsheetApp.getActive();
-  const modeCell = ss.getRangeByName(ALMOX_ANTI.EDIT_MODE_NAMED);
-  if (!modeCell) throw new Error('ANTI_EDIT_MODE não encontrado. Rode almox_anti_setup().');
-
-  const lock = LockService.getDocumentLock();
-  lock.waitLock(30 * 1000);
-
-  const prev = !!modeCell.getValue();
-  try {
-    modeCell.setValue(true);
-    const ret = fn ? fn() : null;
-
-    // Atualiza snapshot apenas dos ranges alterados
-    if (touchRanges && touchRanges.length) {
-      almox_anti_updateSnapshotForRanges_(ss, touchRanges);
-    }
-
-    return ret;
-  } finally {
-    try { modeCell.setValue(prev); } catch (_) {}
-    try { lock.releaseLock(); } catch (_) {}
-  }
+/* ========= Menu ========= */
+function onOpen() {
+  buildMenu_();
 }
 
-/** Atualiza snapshot só para ranges específicos (bem mais leve que refresh geral). */
-function almox_anti_updateSnapshotForRanges_(ss, ranges) {
-  ss = ss || SpreadsheetApp.getActive();
-  const bySheet = new Map();
-
-  (ranges || []).forEach(rg => {
-    if (!rg) return;
-    const sh = rg.getSheet();
-    const id = sh.getSheetId();
-    if (!bySheet.has(id)) bySheet.set(id, { sheet: sh, ranges: [] });
-    bySheet.get(id).ranges.push(rg);
-  });
-
-  for (const entry of bySheet.values()) {
-    const sh = entry.sheet;
-    const snap = almox_anti_getSnapSheet_(ss, sh, { createIfMissing: true });
-
-    // Garante tamanho do snapshot até o máximo necessário
-    let maxR = 1, maxC = 1;
-    entry.ranges.forEach(rg => {
-      maxR = Math.max(maxR, rg.getLastRow());
-      maxC = Math.max(maxC, rg.getLastColumn());
-    });
-    almox_anti_ensureSize_(snap, maxR, maxC);
-
-    // Copia valores em chunks (reduz Service error)
-    entry.ranges.forEach(rg => {
-      almox_anti_copyValuesChunked_(rg, snap.getRange(rg.getRow(), rg.getColumn(), rg.getNumRows(), rg.getNumColumns()));
-    });
-  }
+function ETQ_addMenu_() {
+  buildMenu_();
 }
 
-function almox_anti_copyValuesChunked_(srcRange, dstRangeSameSize) {
-  const rows = srcRange.getNumRows();
-  const cols = srcRange.getNumColumns();
-  const sr = srcRange.getRow();
-  const sc = srcRange.getColumn();
-
-  for (let rOff = 0; rOff < rows; rOff += ALMOX_ANTI.ROW_CHUNK) {
-    const h = Math.min(ALMOX_ANTI.ROW_CHUNK, rows - rOff);
-
-    for (let cOff = 0; cOff < cols; cOff += ALMOX_ANTI.COL_CHUNK) {
-      const w = Math.min(ALMOX_ANTI.COL_CHUNK, cols - cOff);
-
-      const src = srcRange.getSheet().getRange(sr + rOff, sc + cOff, h, w);
-      const dst = dstRangeSameSize.getSheet().getRange(sr + rOff, sc + cOff, h, w);
-
-      almox_anti_retry_(() => {
-        src.copyTo(dst, SpreadsheetApp.CopyPasteType.PASTE_VALUES, false);
-      }, 'snapshot.chunk.copyTo');
-    }
-    Utilities.sleep(10);
-  }
-}
-
-/* =====================================================================
- * 0.2) Trigger diário 03:00
- * ===================================================================== */
-function almox_anti_installDailyTrigger_() {
-  const FN = 'almox_anti_rotinaDiaria_';
-
-  ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction && t.getHandlerFunction() === FN)
-    .forEach(t => { try { ScriptApp.deleteTrigger(t); } catch (_) {} });
-
-  ScriptApp.newTrigger(FN)
-    .timeBased()
-    .atHour(3)       // 03:00
-    .everyDays(1)
-    .create();
-}
-
-/** Rotina diária (silenciosa): trava, atualiza snapshots e reaplica bloqueio */
-function almox_anti_rotinaDiaria_() {
-  try {
-    const ss = SpreadsheetApp.getActive();
-    const cell = ss.getRangeByName(ALMOX_ANTI.EDIT_MODE_NAMED);
-    if (cell) cell.setValue(false);
-
-    almox_anti_refreshAllSnapshots_();
-    almox_anti_aplicarBloqueio(true); // silent
-  } catch (e) {
-    console.error('almox_anti_rotinaDiaria_:', e);
-  }
+function buildMenu_() {
+  SpreadsheetApp.getUi()
+    .createMenu('ACIONADORES')
+    .addItem("🖨️ Impressão (ETIQUETAS direto → PDF)'", 'almox_impressaoEtiquetasMulti_')
+    .addItem('Liberar permissões', 'liberarPermissoes')
+    .addItem('Anti-edit', 'antiEdit_')
+    .addToUi();
 }
 
 /* =====================================================================
@@ -236,9 +113,9 @@ function almox_lif_handleEdit_(e) {
     const rangeOut = shAlvo.getRange(startRow, CFG_LIF.COL_SAIDA, numRows, 1);
 
     // ✅ Escrita via script SEMPRE permitida + snapshot atualizado só desse range
-    almox_anti_runUnlocked_(ss, () => {
+    withAntiEditTemporaryUnblock_([rangeOut], () => {
       rangeOut.setValues(out);
-    }, [rangeOut]);
+    });
 
     almox_lif_setCounter_(next);
   } finally {
@@ -308,33 +185,7 @@ function Setup_InstalarMenuEtiquetas() {
   SpreadsheetApp.getActive().toast('Menu instalado. Reabra a planilha para ver "ACIONADORES".');
 }
 
-function ETQ_addMenu_() {
-  SpreadsheetApp.getUi()
-    .createMenu('ACIONADORES')
-    .addItem('▶️ Autorizar / Preparar', 'authorizeEverything_SeqEtq')
-    .addSeparator()
-    .addItem('🖨️ Impressão (Fracionamentos → Etiquetas → PDF)', 'runFracionamentosToEtiquetasAndPrint_')
-    .addItem('🖨️ Impressão (ETIQUETAS direto → PDF)', 'almox_impressaoEtiquetasMulti_')
-    .addSeparator()
-    .addItem('🔒 Anti Mão-Boba (SETUP)', 'almox_anti_setup')
-    .addItem('🔒 Anti Mão-Boba (Aplicar bloqueio)', 'almox_anti_aplicarBloqueio')
-    .addItem('🔓 Anti Mão-Boba (Liberar 10 min)', 'almox_anti_liberar10min')
-    .addItem('🔒 Anti Mão-Boba (Travar agora)', 'almox_anti_travarAgora')
-    .addItem('🧹 Anti Mão-Boba (Remover bloqueio)', 'almox_anti_removerBloqueio')
-    .addToUi();
-}
-
-function authorizeEverything_SeqEtq() {
-  try {
-    const id = ETQ__getTemplateSlidesId_();
-    try { DriveApp.getFileById(id).getName(); } catch (_) {}
-    try { SlidesApp.openById(id); } catch (_) {}
-    try { UrlFetchApp.fetch('https://www.gstatic.com/generate_204'); } catch (_) {}
-    SpreadsheetApp.getActive().toast('Permissões verificadas/ativadas.', 'ACESSOS', 5);
-  } catch (e) {
-    SpreadsheetApp.getActive().toast('Autorizar: ' + (e && e.message ? e.message : e), 'ACESSOS', 10);
-  }
-}
+// (menu criado por onOpen/ETQ_addMenu_)
 
 function ETQ__extractSlidesIdFromUrl_(url) {
   if (!url) return '';
@@ -381,6 +232,18 @@ function ETQ__getTemplateSlidesId_() {
   const id = idFromSheet || fallback;
   if (!id) throw new Error('Defina o modelo via hyperlink em "LIBERAÇÃO IMPORTRANGE!A1" ou em CFG_ETQ.template.slidesId.');
   return id;
+}
+
+function liberarPermissoes() {
+  try { SpreadsheetApp.getActive(); } catch (_) {}
+  try { SpreadsheetApp.getUi(); } catch (_) {}
+  try { SpreadsheetApp.getActive().getId(); } catch (_) {}
+  try { Session.getActiveUser().getEmail(); } catch (_) {}
+  try { PropertiesService.getDocumentProperties().getKeys(); } catch (_) {}
+  try { ScriptApp.getProjectTriggers(); } catch (_) {}
+  try { UrlFetchApp.fetch('https://www.google.com', { muteHttpExceptions: true }); } catch (_) {}
+  try { MailApp.getRemainingDailyQuota(); } catch (_) {}
+  try { SpreadsheetApp.getActive().toast('Permissões solicitadas com sucesso.', 'Permissões', 6); } catch (_) {}
 }
 
 function ETQ__qtyToInt_(raw) {
@@ -532,20 +395,20 @@ function runFracionamentosToEtiquetasAndPrint_() {
   const rangeI = shE.getRange(writeR, etqColI, n, 1);
 
   // 1) Escreve em ETIQUETAS com permissão garantida + snapshot pontual
-  almox_anti_runUnlocked_(ss, () => {
+  withAntiEditTemporaryUnblock_([rangeF, rangeI], () => {
     rangeF.setValues(toF);
     rangeI.setValues(toI);
-  }, [rangeF, rangeI]);
+  });
 
   // 2) Gera PDF (não precisa ficar em modo edit liberado)
   try {
     almox_impressaoEtiquetasMulti_();
   } finally {
     // 3) Limpa ETIQUETAS com permissão garantida + snapshot pontual
-    almox_anti_runUnlocked_(ss, () => {
+    withAntiEditTemporaryUnblock_([rangeF, rangeI], () => {
       rangeF.clearContent();
       rangeI.clearContent();
-    }, [rangeF, rangeI]);
+    });
   }
 
   // Carimba NOTA em H nas linhas corretas (contíguas em blocos)
@@ -560,9 +423,9 @@ function runFracionamentosToEtiquetasAndPrint_() {
     // nota não afeta DV, mas ainda assim é uma escrita — e pode estar em range travado
     const rgNotes = shF.getRange(g.start, colH, g.len, 1);
 
-    almox_anti_runUnlocked_(ss, () => {
+    withAntiEditTemporaryUnblock_([rgNotes], () => {
       rgNotes.setNotes(notesMatrix);
-    }, []); // sem necessidade de snapshot (notes não entram na validação)
+    });
   });
 
   SpreadsheetApp.getActive().toast('Impressão concluída ✅', 'Impressão', 6);
@@ -750,401 +613,282 @@ function ETQ_lineClampRawNoWrap_(raw, wMm) {
 }
 
 /* =====================================================================
- * 3) ANTI MÃO-BOBA — SETUP / APLICAR / LIBERAR / TRAVAR / REMOVER
+ * 3) ANTI-EDIT (snapshot + validação com rejeição)
  * ===================================================================== */
 
-function almox_anti_setup() {
-  const ss = SpreadsheetApp.getActive();
-
-  // Config sheet
-  let sh = ss.getSheetByName(ALMOX_ANTI.CONFIG_SHEET);
-  if (!sh) sh = ss.insertSheet(ALMOX_ANTI.CONFIG_SHEET);
-
-  sh.getRange(ALMOX_ANTI.EDIT_MODE_A1).setValue(false);
-  try { sh.hideSheet(); } catch (_) {}
-
-  const cell = sh.getRange(ALMOX_ANTI.EDIT_MODE_A1);
-  const existing = ss.getNamedRanges().find(nr => nr.getName() === ALMOX_ANTI.EDIT_MODE_NAMED);
-  if (existing) existing.setRange(cell);
-  else ss.setNamedRange(ALMOX_ANTI.EDIT_MODE_NAMED, cell);
-
-  // Trigger diário 03:00
-  almox_anti_installDailyTrigger_();
-
-  ss.toast('Anti Mão-Boba: setup concluído ✅', 'Anti Mão-Boba', 4);
+function antiEditIdentify_() {
+  ensureAntiEditSetup_();
+  SpreadsheetApp.getActive().toast('Anti-edit identificado.', 'Anti-edit', 4);
 }
 
-/**
- * Aplica bloqueio:
- * - Copia snapshot dos blocos protegidos (sparse)
- * - Aplica DataValidation (bloqueio) somente nessas áreas
- * - Respeita "exceto algumas células"
- */
-function almox_anti_aplicarBloqueio(silent) {
-  const SILENT = !!silent;
+function antiEdit_() {
   const ss = SpreadsheetApp.getActive();
+  deleteAntiEditSheets_(ss);
+  antiEditRemove_();
+  antiEditIdentify_();
+  antiEditApply_();
+  ss.toast('Anti-edit concluído.', 'Anti-edit', 6);
+}
 
-  // garante trigger diário
-  almox_anti_installDailyTrigger_();
+function antiEditApply_() {
+  const ss = SpreadsheetApp.getActive();
+  ensureAntiEditSetupForSpreadsheet_(ss);
 
-  const modeCell = ss.getRangeByName(ALMOX_ANTI.EDIT_MODE_NAMED);
-  if (!modeCell) {
-    if (!SILENT) SpreadsheetApp.getUi().alert('Anti Mão-Boba', 'Rode primeiro: "almox_anti_setup()".', SpreadsheetApp.getUi().ButtonSet.OK);
-    console.error('Anti Mão-Boba: faltou rodar almox_anti_setup().');
-    return;
-  }
+  const ruleBySnap = {};
+  const sheetProtections = ss.getProtections(SpreadsheetApp.ProtectionType.SHEET) || [];
+  const rangeProtections = ss.getProtections(SpreadsheetApp.ProtectionType.RANGE) || [];
 
-  const sheetProtections = ss.getProtections(SpreadsheetApp.ProtectionType.SHEET);
-  const rangeProtections = ss.getProtections(SpreadsheetApp.ProtectionType.RANGE);
-
-  if (!sheetProtections.length && !rangeProtections.length) {
-    if (!SILENT) SpreadsheetApp.getUi().alert('Anti Mão-Boba', 'Nenhuma proteção (ABA ou RANGE) foi encontrada.', SpreadsheetApp.getUi().ButtonSet.OK);
-    return;
-  }
-
-  const snapCache = {};
-  function getSnapFor_(sh) {
-    const id = sh.getSheetId();
-    if (!snapCache[id]) snapCache[id] = almox_anti_getSnapSheet_(ss, sh, { reset: true, createIfMissing: true });
-    return snapCache[id];
-  }
-
-  let blocksApplied = 0;
-
-  // Proteção de ABA
   sheetProtections.forEach(p => {
-    const sh = p.getRange().getSheet();
-    const snap = getSnapFor_(sh);
+    if (p.isWarningOnly && p.isWarningOnly()) return;
+    const sheet = p.getRange().getSheet();
+    const unprotected = p.getUnprotectedRanges ? (p.getUnprotectedRanges() || []) : [];
+    const baseRange = buildBaseRangeWithExceptions_(sheet, unprotected);
+    if (!baseRange) return;
 
-    const base = almox_anti_getEffectiveBaseRange_(sh, p);
-    const protectedRects = almox_anti_computeProtectedRectsFromSheetProtection_(p, base);
+    const snapSheet = ensureAntiSnapSheet_(sheet, baseRange);
+    writeSnapshotRange_(snapSheet, baseRange);
 
-    // snapshot sparse
-    almox_anti_writeSnapshotSparse_(snap, sh, protectedRects);
-
-    // aplica DV por retângulo
-    const rule = almox_anti_buildRuleForSnap_(snap.getName());
-    protectedRects.forEach(r => {
-      const rg = sh.getRange(r.sr, r.sc, r.er - r.sr + 1, r.ec - r.sc + 1);
-      almox_anti_retry_(() => rg.setDataValidation(rule), 'setDataValidation.rect');
-      blocksApplied++;
-    });
-
-    // remove DV do Anti nas exceções
-    const unprot = (p.getUnprotectedRanges && p.getUnprotectedRanges()) || [];
-    almox_anti_removeOnlyOurValidation_(unprot);
+    const snapName = snapSheet.getName();
+    const rule = ruleBySnap[snapName] || (ruleBySnap[snapName] = buildAntiValidationRule_(snapName));
+    applyAntiValidationToRangeFast_(baseRange, rule);
+    clearAntiValidationForRanges_(unprotected);
   });
 
-  // Proteção de RANGE
   rangeProtections.forEach(p => {
-    const rg = p.getRange();
-    const sh = rg.getSheet();
-    const snap = getSnapFor_(sh);
+    if (p.isWarningOnly && p.isWarningOnly()) return;
+    const range = p.getRange();
+    if (!range) return;
 
-    const rect = { sr: rg.getRow(), sc: rg.getColumn(), er: rg.getLastRow(), ec: rg.getLastColumn() };
-    almox_anti_writeSnapshotSparse_(snap, sh, [rect]);
+    const snapSheet = ensureAntiSnapSheet_(range.getSheet(), range);
+    writeSnapshotRange_(snapSheet, range);
 
-    const rule = almox_anti_buildRuleForSnap_(snap.getName());
-    almox_anti_retry_(() => rg.setDataValidation(rule), 'setDataValidation.range');
-    blocksApplied++;
+    const snapName = snapSheet.getName();
+    const rule = ruleBySnap[snapName] || (ruleBySnap[snapName] = buildAntiValidationRule_(snapName));
+    applyAntiValidationToRangeFast_(range, rule);
   });
 
-  if (!SILENT) ss.toast(`Anti Mão-Boba aplicado ✅ blocos/ranges: ${blocksApplied}.`, 'Anti Mão-Boba', 8);
+  ss.toast('Anti-edit aplicado.', 'Anti-edit', 5);
 }
 
-function almox_anti_liberar10min() {
+function antiEditRemove_() {
   const ss = SpreadsheetApp.getActive();
-  const cell = ss.getRangeByName(ALMOX_ANTI.EDIT_MODE_NAMED);
-  if (!cell) throw new Error('ANTI_EDIT_MODE não encontrado. Rode almox_anti_setup().');
+  const sheetProtections = ss.getProtections(SpreadsheetApp.ProtectionType.SHEET) || [];
+  const rangeProtections = ss.getProtections(SpreadsheetApp.ProtectionType.RANGE) || [];
 
-  cell.setValue(true);
-
-  ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction && t.getHandlerFunction() === 'almox_anti_travarAgora')
-    .forEach(t => { try { ScriptApp.deleteTrigger(t); } catch (_) {} });
-
-  ScriptApp.newTrigger('almox_anti_travarAgora')
-    .timeBased()
-    .after(ALMOX_ANTI.UNLOCK_MINUTES * 60 * 1000)
-    .create();
-
-  ss.toast(`Edição liberada por ${ALMOX_ANTI.UNLOCK_MINUTES} min.`, 'Anti Mão-Boba', 5);
-}
-
-function almox_anti_travarAgora() {
-  const ss = SpreadsheetApp.getActive();
-  const cell = ss.getRangeByName(ALMOX_ANTI.EDIT_MODE_NAMED);
-  if (cell) cell.setValue(false);
-
-  // Atualiza snapshots ao travar (reduz "inválido")
-  almox_anti_refreshAllSnapshots_();
-
-  ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction && t.getHandlerFunction() === 'almox_anti_travarAgora')
-    .forEach(t => { try { ScriptApp.deleteTrigger(t); } catch (_) {} });
-
-  ss.toast('Edição travada ✅', 'Anti Mão-Boba', 3);
-}
-
-function almox_anti_removerBloqueio() {
-  const ss = SpreadsheetApp.getActive();
-  let removed = 0;
-
-  ss.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => {
-    const sh = p.getRange().getSheet();
-    const base = almox_anti_getEffectiveBaseRange_(sh, p);
-    const protectedRects = almox_anti_computeProtectedRectsFromSheetProtection_(p, base);
-
-    protectedRects.forEach(r => {
-      const rg = sh.getRange(r.sr, r.sc, r.er - r.sr + 1, r.ec - r.sc + 1);
-      const dv = rg.getCell(1, 1).getDataValidation();
-      if (dv && almox_anti_isOurDv_(dv)) {
-        rg.clearDataValidations();
-        removed++;
-      }
-    });
-
-    const unprot = (p.getUnprotectedRanges && p.getUnprotectedRanges()) || [];
-    almox_anti_removeOnlyOurValidation_(unprot);
+  sheetProtections.forEach(p => {
+    if (p.isWarningOnly && p.isWarningOnly()) return;
+    const sheet = p.getRange().getSheet();
+    const unprotected = p.getUnprotectedRanges ? (p.getUnprotectedRanges() || []) : [];
+    const baseRange = buildBaseRangeWithExceptions_(sheet, unprotected);
+    if (!baseRange) return;
+    clearAntiValidationInRangeFast_(baseRange);
+    clearAntiValidationForRanges_(unprotected);
   });
 
-  ss.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => {
-    const rg = p.getRange();
-    const dv = rg.getCell(1, 1).getDataValidation();
-    if (dv && almox_anti_isOurDv_(dv)) {
-      rg.clearDataValidations();
-      removed++;
+  rangeProtections.forEach(p => {
+    if (p.isWarningOnly && p.isWarningOnly()) return;
+    const range = p.getRange();
+    if (range) clearAntiValidationInRangeFast_(range);
+  });
+
+  ss.toast('Anti-edit removido.', 'Anti-edit', 5);
+}
+
+function deleteAntiEditSheets_(ss) {
+  const sheets = ss.getSheets();
+  sheets.forEach(sheet => {
+    const name = sheet.getName();
+    if (name.indexOf('_ANTI') === 0 || name.indexOf('_Anti') === 0) {
+      try { ss.deleteSheet(sheet); } catch (_) {}
     }
   });
-
-  ss.toast(`Anti Mão-Boba removido em ${removed} bloco(s)/range(s).`, 'Anti Mão-Boba', 6);
 }
 
-/* -------- helpers ANTI -------- */
+function ensureAntiEditSetup_() {
+  return ensureAntiEditSetupForSpreadsheet_(SpreadsheetApp.getActive());
+}
 
-function almox_anti_getSnapSheet_(ss, sheet, opts) {
-  opts = opts || {};
-  const name = ALMOX_ANTI.SNAP_PREFIX + sheet.getSheetId();
-  let snap = ss.getSheetByName(name);
-
-  if (opts.reset) {
-    try {
-      const active = ss.getActiveSheet();
-      if (snap) {
-        if (active && active.getSheetId && active.getSheetId() === snap.getSheetId()) {
-          ss.setActiveSheet(sheet);
-        }
-        ss.deleteSheet(snap);
-      }
-    } catch (_) {}
-    snap = null;
+function ensureAntiEditSetupForSpreadsheet_(ss) {
+  let sheet = ss.getSheetByName(ANTI_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(ANTI_SHEET_NAME);
+    sheet.hideSheet();
   }
 
-  if (!snap && opts.createIfMissing) snap = ss.insertSheet(name);
-  if (snap) { try { snap.hideSheet(); } catch (_) {} }
-  return snap;
+  const modeCell = sheet.getRange(ANTI_MODE_CELL);
+  modeCell.setValue(false);
+  sheet.hideSheet();
+
+  const existing = ss.getNamedRanges().find(nr => nr.getName() === ANTI_MODE_NAMED_RANGE);
+  if (existing) existing.remove();
+  ss.setNamedRange(ANTI_MODE_NAMED_RANGE, modeCell);
+  return modeCell;
 }
 
-function almox_anti_buildRuleForSnap_(snapSheetName) {
-  // Regra: válido se
-  //  - ANTI_EDIT_MODE ligado (scripts / liberação temporária)
-  //  - OU valor atual == snapshot
-  const f =
-    `=OR(${ALMOX_ANTI.EDIT_MODE_NAMED};` +
-    `INDIRECT(ADDRESS(ROW();COLUMN();4))=` +
-    `INDIRECT("'${snapSheetName}'!"&ADDRESS(ROW();COLUMN();4)))`;
+function ensureAntiSnapSheet_(sheet, range) {
+  const ss = sheet.getParent();
+  const snapName = `${ANTI_SNAP_PREFIX}${sheet.getSheetId()}`;
+  let snapSheet = ss.getSheetByName(snapName);
+  if (!snapSheet) {
+    snapSheet = ss.insertSheet(snapName);
+    snapSheet.hideSheet();
+  }
 
+  const lastRow = range.getLastRow();
+  const lastCol = range.getLastColumn();
+  runSheetOpWithRetry_(() => ensureSheetSize_(snapSheet, lastRow, lastCol));
+  snapSheet.hideSheet();
+  return snapSheet;
+}
+
+function buildBaseRangeWithExceptions_(sheet, unprotectedRanges) {
+  let base = sheet.getDataRange();
+  if (!base) return null;
+
+  let minRow = base.getRow();
+  let minCol = base.getColumn();
+  let maxRow = base.getLastRow();
+  let maxCol = base.getLastColumn();
+
+  (unprotectedRanges || []).forEach(r => {
+    if (!r || r.getSheet().getSheetId() !== sheet.getSheetId()) return;
+    minRow = Math.min(minRow, r.getRow());
+    minCol = Math.min(minCol, r.getColumn());
+    maxRow = Math.max(maxRow, r.getLastRow());
+    maxCol = Math.max(maxCol, r.getLastColumn());
+  });
+
+  return sheet.getRange(minRow, minCol, maxRow - minRow + 1, maxCol - minCol + 1);
+}
+
+function writeSnapshotRange_(snapSheet, range) {
+  ensureSheetSize_(snapSheet, range.getLastRow(), range.getLastColumn());
+  forEachRangeChunk_(range, ANTI_CHUNK_ROWS_, chunk => {
+    const values = chunk.getValues();
+    const dst = snapSheet.getRange(chunk.getRow(), chunk.getColumn(), chunk.getNumRows(), chunk.getNumColumns());
+    runSheetOpWithRetry_(() => dst.setValues(values));
+  });
+}
+
+function ensureSheetSize_(sheet, minRows, minCols) {
+  const maxRows = sheet.getMaxRows();
+  const maxCols = sheet.getMaxColumns();
+  if (minRows > maxRows) {
+    runSheetOpWithRetry_(() => sheet.insertRowsAfter(maxRows, minRows - maxRows));
+  }
+  if (minCols > maxCols) {
+    runSheetOpWithRetry_(() => sheet.insertColumnsAfter(maxCols, minCols - maxCols));
+  }
+}
+
+function buildAntiValidationRule_(snapName) {
+  const sep = getFormulaSeparator_();
+  const formula = `=OR(${ANTI_MODE_NAMED_RANGE}${sep}INDIRECT("'${snapName}'!"&ADDRESS(ROW()${sep}COLUMN()${sep}4))=INDIRECT(ADDRESS(ROW()${sep}COLUMN()${sep}4)))`;
   return SpreadsheetApp.newDataValidation()
-    .requireFormulaSatisfied(f)
+    .requireFormulaSatisfied(formula)
     .setAllowInvalid(false)
-    .setHelpText(ALMOX_ANTI.HELP_TEXT)
     .build();
 }
 
-function almox_anti_isOurDv_(dv) {
-  try {
-    const help = dv.getHelpText && dv.getHelpText();
-    const allow = dv.getAllowInvalid && dv.getAllowInvalid();
-    return help === ALMOX_ANTI.HELP_TEXT && allow === false;
-  } catch (_) { return false; }
+function getFormulaSeparator_() {
+  let locale = '';
+  try { locale = SpreadsheetApp.getActive().getSpreadsheetLocale() || ''; } catch (_) {}
+  if (/^(pt|fr|es|it|de|ru|tr|nl|pl|sv|nb|da|fi|cs|sk|hu|ro|bg|el|uk|lt|lv|et|sl|hr|sr|mk|is|ga|mt)/i.test(locale)) {
+    return ';';
+  }
+  return ',';
 }
 
-function almox_anti_removeOnlyOurValidation_(ranges) {
-  for (const rg of ranges || []) {
-    if (!rg) continue;
-    const dvs = rg.getDataValidations();
+function applyAntiValidationToRangeFast_(range, rule) {
+  forEachRangeChunk_(range, ANTI_CHUNK_ROWS_, chunk => {
+    runSheetOpWithRetry_(() => chunk.setDataValidation(rule));
+  });
+}
+
+function clearAntiValidationInRangeFast_(range) {
+  forEachRangeChunk_(range, ANTI_CHUNK_ROWS_, chunk => {
+    const dvs = chunk.getDataValidations();
     let changed = false;
     for (let r = 0; r < dvs.length; r++) {
       for (let c = 0; c < dvs[0].length; c++) {
         const dv = dvs[r][c];
-        if (dv && almox_anti_isOurDv_(dv)) { dvs[r][c] = null; changed = true; }
+        if (isAntiEditValidation_(dv)) {
+          dvs[r][c] = null;
+          changed = true;
+        }
       }
     }
-    if (changed) rg.setDataValidations(dvs);
+    if (changed) runSheetOpWithRetry_(() => chunk.setDataValidations(dvs));
+  });
+}
+
+function clearAntiValidationForRanges_(ranges) {
+  const list = (ranges || []).filter(Boolean);
+  if (!list.length) return;
+  list.forEach(r => {
+    clearAntiValidationInRangeFast_(r);
+  });
+}
+
+function withAntiEditTemporaryUnblock_(ranges, fn) {
+  const list = (ranges || []).filter(Boolean);
+  if (!list.length) return fn();
+
+  const ss = list[0].getSheet().getParent();
+  const modeCell = ss.getRangeByName(ANTI_MODE_NAMED_RANGE);
+  if (!modeCell) return fn();
+
+  clearAntiValidationForRanges_(list);
+  const result = fn();
+  try { SpreadsheetApp.flush(); } catch (_) {}
+
+  const ruleBySnap = {};
+  list.forEach(r => {
+    const sheet = r.getSheet();
+    const snapSheet = ensureAntiSnapSheet_(sheet, r);
+    writeSnapshotRange_(snapSheet, r);
+    const snapName = snapSheet.getName();
+    const rule = ruleBySnap[snapName] || (ruleBySnap[snapName] = buildAntiValidationRule_(snapName));
+    applyAntiValidationToRangeFast_(r, rule);
+  });
+  return result;
+}
+
+function isAntiEditValidation_(dv) {
+  try {
+    if (!dv) return false;
+    if (dv.getCriteriaType && dv.getCriteriaType() !== SpreadsheetApp.DataValidationCriteria.CUSTOM_FORMULA) return false;
+    const values = dv.getCriteriaValues && dv.getCriteriaValues();
+    const formula = values && values[0] ? String(values[0]) : '';
+    return formula.indexOf(ANTI_MODE_NAMED_RANGE) !== -1 && formula.indexOf(ANTI_SNAP_PREFIX) !== -1;
+  } catch (_) {
+    return false;
   }
 }
 
-function almox_anti_getEffectiveBaseRange_(sheet, sheetProtection) {
-  let lastRow = Math.max(1, sheet.getLastRow());
-  let lastCol = Math.max(1, sheet.getLastColumn());
-
-  const unprot = (sheetProtection.getUnprotectedRanges && sheetProtection.getUnprotectedRanges()) || [];
-  unprot.forEach(rg => {
-    if (!rg) return;
-    if (rg.getSheet().getSheetId() !== sheet.getSheetId()) return;
-    lastRow = Math.max(lastRow, rg.getLastRow());
-    lastCol = Math.max(lastCol, rg.getLastColumn());
-  });
-
-  lastRow = Math.min(lastRow, ALMOX_ANTI.SAFE_MAX_ROW);
-  lastCol = Math.min(lastCol, ALMOX_ANTI.SAFE_MAX_COL);
-
-  return sheet.getRange(1, 1, lastRow, lastCol);
-}
-
-function almox_anti_computeProtectedRectsFromSheetProtection_(sheetProtection, baseRange) {
-  const sh = baseRange.getSheet();
-
-  const bSr = baseRange.getRow();
-  const bSc = baseRange.getColumn();
-  const bEr = bSr + baseRange.getNumRows() - 1;
-  const bEc = bSc + baseRange.getNumColumns() - 1;
-
-  const unprot = (sheetProtection.getUnprotectedRanges && sheetProtection.getUnprotectedRanges()) || [];
-  const rects = [];
-
-  unprot.forEach(rg => {
-    if (!rg) return;
-    if (rg.getSheet().getSheetId() !== sh.getSheetId()) return;
-
-    const sr = Math.max(bSr, rg.getRow());
-    const sc = Math.max(bSc, rg.getColumn());
-    const er = Math.min(bEr, rg.getLastRow());
-    const ec = Math.min(bEc, rg.getLastColumn());
-    if (sr > er || sc > ec) return;
-
-    rects.push({ sr, sc, er, ec });
-  });
-
-  if (!rects.length) return [{ sr: bSr, sc: bSc, er: bEr, ec: bEc }];
-
-  const rowCuts = new Set([bSr, bEr + 1]);
-  const colCuts = new Set([bSc, bEc + 1]);
-  rects.forEach(r => { rowCuts.add(r.sr); rowCuts.add(r.er + 1); colCuts.add(r.sc); colCuts.add(r.ec + 1); });
-
-  const rows = Array.from(rowCuts).sort((a, b) => a - b);
-  const cols = Array.from(colCuts).sort((a, b) => a - b);
-
-  const protectedRects = [];
-
-  for (let i = 0; i < rows.length - 1; i++) {
-    const sr = rows[i], er = rows[i + 1] - 1;
-    if (sr > er) continue;
-
-    for (let j = 0; j < cols.length - 1; j++) {
-      const sc = cols[j], ec = cols[j + 1] - 1;
-      if (sc > ec) continue;
-
-      let isUnprotected = false;
-      for (const u of rects) {
-        if (sr >= u.sr && er <= u.er && sc >= u.sc && ec <= u.ec) { isUnprotected = true; break; }
-      }
-      if (!isUnprotected) protectedRects.push({ sr, sc, er, ec });
-    }
-  }
-
-  return protectedRects;
-}
-
-function almox_anti_writeSnapshotSparse_(snapSheet, srcSheet, rects) {
-  if (!rects || !rects.length) return;
-
-  let maxR = 1, maxC = 1;
-  rects.forEach(r => { maxR = Math.max(maxR, r.er); maxC = Math.max(maxC, r.ec); });
-  almox_anti_ensureSize_(snapSheet, maxR, maxC);
-
-  for (const r of rects) {
-    const nr = r.er - r.sr + 1;
-    const nc = r.ec - r.sc + 1;
-
-    for (let rOff = 0; rOff < nr; rOff += ALMOX_ANTI.ROW_CHUNK) {
-      const h = Math.min(ALMOX_ANTI.ROW_CHUNK, nr - rOff);
-
-      for (let cOff = 0; cOff < nc; cOff += ALMOX_ANTI.COL_CHUNK) {
-        const w = Math.min(ALMOX_ANTI.COL_CHUNK, nc - cOff);
-
-        const src = srcSheet.getRange(r.sr + rOff, r.sc + cOff, h, w);
-        const dst = snapSheet.getRange(r.sr + rOff, r.sc + cOff, h, w);
-
-        almox_anti_retry_(() => {
-          src.copyTo(dst, SpreadsheetApp.CopyPasteType.PASTE_VALUES, false);
-        }, 'snapshot.sparse.copyTo');
-      }
-      Utilities.sleep(10);
+function runSheetOpWithRetry_(fn) {
+  const retries = 4;
+  for (let i = 0; i < retries; i++) {
+    try {
+      return fn();
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      Utilities.sleep(250 * (i + 1));
     }
   }
 }
 
-function almox_anti_ensureSize_(sheet, minRows, minCols) {
-  const r = sheet.getMaxRows();
-  const c = sheet.getMaxColumns();
-  const addR = Math.max(0, minRows - r);
-  const addC = Math.max(0, minCols - c);
+function forEachRangeChunk_(range, maxRows, fn) {
+  const sheet = range.getSheet();
+  const startRow = range.getRow();
+  const startCol = range.getColumn();
+  const numRows = range.getNumRows();
+  const numCols = range.getNumColumns();
 
-  if (addR > 20000 || addC > 1000) {
-    throw new Error(`Anti Mão-Boba: snapshot precisaria crescer demais (rows +${addR}, cols +${addC}).`);
+  const step = Math.max(1, Number(maxRows) || numRows);
+  for (let r = 0; r < numRows; r += step) {
+    const rows = Math.min(step, numRows - r);
+    const chunk = sheet.getRange(startRow + r, startCol, rows, numCols);
+    fn(chunk);
   }
-
-  if (addR > 0) almox_anti_retry_(() => sheet.insertRowsAfter(r, addR), 'insertRowsAfter');
-  if (addC > 0) almox_anti_retry_(() => sheet.insertColumnsAfter(c, addC), 'insertColumnsAfter');
-}
-
-function almox_anti_retry_(fn, label) {
-  let lastErr = null;
-  for (let i = 0; i < ALMOX_ANTI.RETRIES; i++) {
-    try { return fn(); }
-    catch (e) {
-      lastErr = e;
-      const msg = String(e && e.message ? e.message : e);
-      if (/Service error|Spreadsheets|Internal error|Limit exceeded/i.test(msg)) {
-        Utilities.sleep(350 * (i + 1));
-        continue;
-      }
-      throw e;
-    }
-  }
-  throw new Error(`${label || 'operação'} falhou após ${ALMOX_ANTI.RETRIES} tentativas: ${
-    lastErr && lastErr.message ? lastErr.message : lastErr
-  }`);
-}
-
-/** Atualiza snapshots de todas as proteções (use com parcimônia; rotina diária usa isso). */
-function almox_anti_refreshAllSnapshots_() {
-  const ss = SpreadsheetApp.getActive();
-  const snapCache = {};
-
-  function getSnapFor_(sh) {
-    const id = sh.getSheetId();
-    if (!snapCache[id]) snapCache[id] = almox_anti_getSnapSheet_(ss, sh, { reset: true, createIfMissing: true });
-    return snapCache[id];
-  }
-
-  ss.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => {
-    const sh = p.getRange().getSheet();
-    const snap = getSnapFor_(sh);
-    const base = almox_anti_getEffectiveBaseRange_(sh, p);
-    const protectedRects = almox_anti_computeProtectedRectsFromSheetProtection_(p, base);
-    almox_anti_writeSnapshotSparse_(snap, sh, protectedRects);
-
-    const unprot = (p.getUnprotectedRanges && p.getUnprotectedRanges()) || [];
-    almox_anti_removeOnlyOurValidation_(unprot);
-  });
-
-  ss.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => {
-    const rg = p.getRange();
-    const sh = rg.getSheet();
-    const snap = getSnapFor_(sh);
-    const rect = { sr: rg.getRow(), sc: rg.getColumn(), er: rg.getLastRow(), ec: rg.getLastColumn() };
-    almox_anti_writeSnapshotSparse_(snap, sh, [rect]);
-  });
 }
